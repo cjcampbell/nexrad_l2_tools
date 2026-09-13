@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Scratch archives made while testing. The real archive lives outside this repo.
+test_archive*/
+archive_v*/
