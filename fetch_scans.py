@@ -89,13 +89,18 @@ ENV_ARCHIVE = "NEXRAD_L2_ARCHIVE"
 DEFAULT_STATIONS = HERE / "nexrad_stations.csv"
 DEFAULT_TIMEZONES = HERE / "station_timezones.csv"
 
+# A single row asking for more than a month of volumes is a typo far more often than an
+# intention: one mistyped offset turns into weeks of prefix listings aimed at someone
+# else's bucket. A genuinely long period is expressed as several rows.
+MAX_INTERVAL_DAYS = 31
+
 INDEX_COLUMNS = [
     "run_id", "s3_key", "station", "utc_time", "ref_date", "anchor", "offset_min",
     "bytes", "sha256", "status", "fetched_utc",
 ]
 LEDGER_COLUMNS = [
     "run_id", "utc_started", "utc_finished", "netid", "project", "mode", "selection",
-    "anchor", "from_min", "to_min", "margin_min", "n_selected", "n_fetched", "n_present",
+    "selection_sha256", "anchor", "from_min", "to_min", "margin_min", "n_selected", "n_fetched", "n_present",
     "n_missing", "n_failed", "bytes_fetched", "tool", "tool_sha256", "source_commit",
     "host", "notes",
 ]
@@ -225,6 +230,31 @@ def interval_for(row: dict, date: dt_date, lat: float, lon: float, tz: str,
             kind, instant)
 
 
+def check_intervals(rows, default_from: float, default_to: float, margin: float) -> None:
+    """Refuse impossible or runaway intervals before a single prefix is listed.
+
+    The span needs no astronomy - it is the offsets alone - so it can be checked up
+    front, which is the whole point: the damage a mistyped offset does is measured in
+    requests to an upstream bucket, and those happen during listing.
+    """
+    for n, row in enumerate(rows, start=1):
+        where = f"row {n} ({row.get('station', '?')} {row.get('date') or row.get('local_date', '?')})"
+        if row.get("start_utc") and row.get("end_utc"):
+            span = _parse_utc(row["end_utc"]) - _parse_utc(row["start_utc"])
+        else:
+            low = float(row["from_min"]) if row.get("from_min") else default_from
+            high = float(row["to_min"]) if row.get("to_min") else default_to
+            span = timedelta(minutes=(high - low) + 2 * margin)
+
+        if span < timedelta(0):
+            raise SystemExit(f"{where}: the interval ends before it starts.")
+        if span > timedelta(days=MAX_INTERVAL_DAYS):
+            raise SystemExit(
+                f"{where}: asks for {span.days} days, over the {MAX_INTERVAL_DAYS}-day "
+                "limit. That is usually a mistyped offset; if it is not, split the "
+                "period across several rows.")
+
+
 def check_rows_resolvable(rows, stations, timezones, default_anchor,
                           stations_path, timezones_path, skip_unknown) -> None:
     """Stop before any listing if a row cannot be resolved.
@@ -287,8 +317,6 @@ def select_from_rows(rows, stations, timezones, default_anchor, default_from,
             logging.warning("Anchor %s undefined at %s on %s (polar day or night); skipping.",
                             anchor_name, station, date_text)
             continue
-        if high < low:
-            raise SystemExit(f"{station} {date_text}: interval ends before it starts")
 
         day = low.date()
         while day <= high.date():
@@ -390,6 +418,28 @@ def fetch_one(key: str, scans_dir: Path, verify_existing: bool,
     return "failed", 0, ""
 
 
+def store_selection(path: Path, archive: Path) -> str:
+    """Keep the run's own selection file, addressed by its content. Returns the hash.
+
+    The ledger records which file a run was given, but a path is not a record: the file
+    is edited, and two rows citing `nights.csv` then describe different requests. Storing
+    the bytes makes the request itself recoverable - and the request is the only place a
+    row that resolved to NO volumes survives, since the index lists what was touched. A
+    night with nothing in its window is a data gap worth being able to find again.
+
+    Content-addressed rather than one copy per run: the same list fetched fifty times is
+    stored once, and a name that is a hash of the bytes cannot be updated in place, so
+    the archive's no-overwrite rule holds by construction rather than by discipline.
+    """
+    digest = _sha256(path)
+    store = archive / "selections"
+    store.mkdir(parents=True, exist_ok=True)
+    stored = store / f"{digest[:16]}{path.suffix or '.txt'}"
+    if not stored.exists():
+        stored.write_bytes(path.read_bytes())
+    return digest
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -467,6 +517,7 @@ def main() -> None:
     timezones = read_timezones(args.timezones)
     if args.dates:
         rows = read_selection(args.dates)
+        check_intervals(rows, args.from_min, args.to_min, args.margin)
         check_rows_resolvable(rows, stations, timezones, args.anchor,
                               args.stations, args.timezones, args.skip_unknown_stations)
         selected = select_from_rows(rows, stations, timezones,
@@ -482,6 +533,10 @@ def main() -> None:
                      len(selected), on_disk, len(selected) - on_disk)
         logging.info("Dry run: nothing written, no ledger row recorded.")
         return
+
+    # Stored before a single volume is fetched, so an interrupted run still leaves its
+    # request on record.
+    selection_sha = store_selection(args.dates or args.keys, args.archive)
 
     (args.archive / "index").mkdir(parents=True, exist_ok=True)
     index_path = args.archive / "index" / f"{run_id}.csv"
@@ -525,6 +580,7 @@ def main() -> None:
         "utc_started": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "utc_finished": finished.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "netid": args.user, "project": args.project, "mode": mode, "selection": selection,
+        "selection_sha256": selection_sha,
         "anchor": args.anchor if mode == "dates" else "keys",
         "from_min": args.from_min if mode == "dates" else "",
         "to_min": args.to_min if mode == "dates" else "",

@@ -55,7 +55,8 @@ computed and the archive simply honours it.
 | `utc_started`, `utc_finished` | run bounds |
 | `netid`, `project` | who, and what for — both required |
 | `mode` | `dates` or `keys` |
-| `selection` | path of the file the run was given |
+| `selection` | path of the file the run was given — context, not a record |
+| `selection_sha256` | hash of that file's contents, and the name it is stored under in `selections/` |
 | `anchor`, `from_min`, `to_min`, `margin_min` | the period rule; `anchor` is `keys` in key mode |
 | `n_selected` | volumes the selection resolved to |
 | `n_fetched` | newly downloaded |
@@ -71,6 +72,26 @@ computed and the archive simply honours it.
 header to its own columns and stops if they differ — a ledger with one version's header
 and another's rows is unreadable, and repairing it would mean editing a shared file. The
 remedy is to rename the old ledger by hand and let a fresh one be created.
+
+## `selections/<sha256[:16]>.<ext>` — the request itself
+
+Every run's selection file is copied here before anything is fetched, addressed by the
+hash of its contents.
+
+A path is not a record: files get edited, and two ledger rows citing `nights.csv` then
+describe different requests. Storing the bytes makes the request recoverable — and the
+request is the only place a row that resolved to **no volumes** survives, since the index
+lists what was touched, not what was asked for. A night with nothing in its window is a
+data gap worth being able to find again.
+
+Content-addressed rather than one copy per run: the same list fetched fifty times is
+stored once, and a name that is a hash of the bytes cannot be updated in place, so the
+no-overwrite rule holds by construction.
+
+**"Asked for but got nothing"** is therefore derivable: the rows of
+`selections/<hash>.csv` that have no matching `ref_date` + `station` in that run's index
+shard. Nothing records it directly, on purpose — a derived answer beats a column that can
+disagree with the two records it summarises.
 
 ## `index/<run_id>.csv` — one row per volume touched
 

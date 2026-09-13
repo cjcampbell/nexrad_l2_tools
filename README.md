@@ -72,6 +72,7 @@ infrastructure. Full column list in [SCHEMAS.md](SCHEMAS.md).
 <archive>/
   scans/YYYY/MM/DD/STATION/<scan>   mirrors the upstream S3 key structure exactly
   index/<run_id>.csv                one row per volume a run touched
+  selections/<hash>.csv             the request itself, addressed by its contents
   acquisitions.csv                  one row per run: who, when, which project, which code
   logs/<run_id>.log                 free text, for debugging
 ```
@@ -85,6 +86,12 @@ Three rules, because the archive is shared:
    the next project to mistake for a whole volume.
 3. **Every run identifies itself**, and the ledger records the checksum of the code that
    ran, so a scan can be traced to the person, project and version that asked for it.
+   The selection file is kept too, so the request survives even when the file that
+   expressed it is later edited.
+
+A single row may not ask for more than 31 days of volumes. That is nearly always a
+mistyped offset, and the cost of one falls on the upstream bucket; express a genuinely
+long period as several rows.
 
 ## Files
 

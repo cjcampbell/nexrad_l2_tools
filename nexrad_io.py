@@ -25,6 +25,7 @@ suffix is assumed. Keys are resolved here by listing the station-date prefix, an
 every join between labels and scans goes through `scan_stem()`.
 """
 
+import os
 import time
 import urllib.parse
 import urllib.request
@@ -119,6 +120,15 @@ def download_scan(
     Returns the local path and its size in bytes. Retries with exponential backoff,
     and verifies the payload against Content-Length so a truncated read is not
     written to disk as if it were complete.
+
+    The write is ATOMIC: bytes land in a `.part` file beside the target and are renamed
+    into place only once the payload is whole. Writing straight to `local_path` leaves a
+    short file behind whenever a run is interrupted mid-write, and `skip_existing` cannot
+    tell a short file from a complete volume - it only asks whether something is there
+    and non-empty. The next run therefore accepts the fragment and every stage
+    downstream reads a truncated scan. That is survivable in a private archive, where a
+    py-ART failure eventually gives it away; it is not survivable in a shared one, where
+    another project silently inherits it.
     """
     local_path = local_dir.joinpath(*s3_key.split("/"))
     local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,6 +137,8 @@ def download_scan(
         return local_path, local_path.stat().st_size
 
     url = f"{UNIDATA_URL}/{s3_key}"
+    # The pid keeps two processes fetching the same scan from sharing a part file.
+    part_path = local_path.with_name(f"{local_path.name}.part-{os.getpid()}")
     for attempt in range(1, max_retries + 1):
         try:
             with urllib.request.urlopen(url, timeout=120) as response:
@@ -134,9 +146,11 @@ def download_scan(
                 payload = response.read()
             if expected and len(payload) != expected:
                 raise RuntimeError(f"Truncated: got {len(payload)} of {expected} bytes")
-            local_path.write_bytes(payload)
+            part_path.write_bytes(payload)
+            os.replace(part_path, local_path)  # atomic within the directory
             return local_path, len(payload)
         except Exception as exc:
+            part_path.unlink(missing_ok=True)
             if attempt == max_retries:
                 raise RuntimeError(
                     f"Failed to download {s3_key} after {max_retries} attempts: {exc}"
