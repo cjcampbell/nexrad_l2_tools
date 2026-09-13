@@ -63,7 +63,9 @@ import logging
 import os
 import socket
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.error
 import urllib.request
 import uuid
@@ -93,6 +95,14 @@ DEFAULT_TIMEZONES = HERE / "station_timezones.csv"
 # intention: one mistyped offset turns into weeks of prefix listings aimed at someone
 # else's bucket. A genuinely long period is expressed as several rows.
 MAX_INTERVAL_DAYS = 31
+
+# Concurrency is deliberately low. The upstream mirror is a public good that nobody is
+# paid to defend, and a survey of this archive is never so urgent that it justifies
+# leaning on it: four streams keep a single run's throughput honest without ever looking
+# like a stampede. The ceiling exists so a future caller cannot casually turn a polite
+# tool into an impolite one.
+DEFAULT_WORKERS = 4
+MAX_WORKERS = 16
 
 INDEX_COLUMNS = [
     "run_id", "s3_key", "station", "utc_time", "ref_date", "anchor", "offset_min",
@@ -480,6 +490,10 @@ def main() -> None:
                         help="record a checksum for scans already on disk, so a later "
                              "integrity pass has a baseline; reads every such file, so "
                              "off by default")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                        help=f"parallel fetches (default {DEFAULT_WORKERS}, max "
+                             f"{MAX_WORKERS}). Kept low on purpose: the upstream mirror "
+                             "is a shared public resource")
     parser.add_argument("--skip-unknown-stations", action="store_true",
                         help="warn and continue past stations missing from the station "
                              "table, instead of stopping. Off by default: a typo that "
@@ -496,6 +510,9 @@ def main() -> None:
                 f"{ENV_ARCHIVE} in your environment. There is deliberately no default: "
                 "guessing where to put several TB of radar data is not a favour.")
         args.archive = Path(from_env)
+
+    if not 1 <= args.workers <= MAX_WORKERS:
+        raise SystemExit(f"--workers must be between 1 and {MAX_WORKERS}")
 
     run_id = new_run_id(args.user)
     scans_dir = args.archive / "scans"
@@ -548,10 +565,19 @@ def main() -> None:
     with open(index_path, "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=INDEX_COLUMNS)
         writer.writeheader()
-        try:
-            for n, row in enumerate(selected, start=1):
-                status, size, digest = fetch_one(row["s3_key"], scans_dir,
-                                                 args.verify_existing)
+        # One lock guards the counters and the index writer together. Rows are written
+        # as each fetch COMPLETES, so the shard is in completion order rather than
+        # selection order - which keeps it crash-safe (an interrupted run has recorded
+        # everything that finished) at the cost of a shard that needs sorting to read
+        # chronologically. The volumes themselves are unaffected: each lands atomically
+        # at a path derived from its key.
+        lock = threading.Lock()
+        done = 0
+
+        def record(row, result):
+            nonlocal bytes_fetched, done
+            status, size, digest = result
+            with lock:
                 counts[status] += 1
                 if status == "fetched":
                     bytes_fetched += size
@@ -563,15 +589,28 @@ def main() -> None:
                     "sha256": digest, "status": status,
                     "fetched_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 })
-                if n % 100 == 0:
+                done += 1
+                if done % 100 == 0:
                     handle.flush()
                     logging.info("%d/%d  fetched %d, present %d, missing %d, failed %d",
-                                 n, len(selected), counts["fetched"], counts["present"],
+                                 done, len(selected), counts["fetched"], counts["present"],
                                  counts["not_in_archive"], counts["failed"])
+
+        logging.info("Fetching %d volumes with %d worker(s).", len(selected), args.workers)
+        pool = ThreadPoolExecutor(max_workers=args.workers)
+        try:
+            futures = {
+                pool.submit(fetch_one, row["s3_key"], scans_dir, args.verify_existing): row
+                for row in selected
+            }
+            for future in as_completed(futures):
+                record(futures[future], future.result())
         except KeyboardInterrupt:
             logging.warning("Interrupted; recording what was fetched.")
+            pool.shutdown(wait=False, cancel_futures=True)
             raise
         finally:
+            pool.shutdown(wait=True)
             handle.flush()
 
     finished = datetime.now(timezone.utc)
