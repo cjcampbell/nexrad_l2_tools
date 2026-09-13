@@ -2,18 +2,16 @@
 
 Tools for building and sharing an archive of NEXRAD Level II radar volumes.
 
-One archive, several projects. The tools here fetch volumes into a shared tree and
-record who fetched what, when, and for which project — so a scan downloaded for one
-study can be reused by another without anyone having to reconstruct where it came from.
+Generates a single shared archive that could be used across multiple projects.
+The tools here fetch volumes into a shared tree and record who fetched what, when, and for which project.
+A scan downloaded for one study can be reused by another without having to reconstruct where it came from or re-download.
 
-**Standard library only, Python 3.10+.** No virtualenv, no conda, no `pip install`. That
-is deliberate: a shared tool that needs an environment is a tool most people will not
-use.
+Standard library only, Python 3.10+.
 
 ## Quick start
 
 ```sh
-# what would be fetched? (always start here)
+# what would be fetched? (start here)
 python3 fetch_scans.py --dates days.csv --user YOUR_NETID --project my_project \
     --archive /path/to/nexrad_l2_data --dry-run
 
@@ -51,11 +49,11 @@ offsets in minutes:
 
 ```sh
 --anchor utc_midnight   --from-min    0 --to-min 1440   # the UTC day (default)
---anchor sunset         --from-min -180 --to-min   60   # bat emergence
---anchor sunrise        --from-min  -60 --to-min   60   # dawn flight
+--anchor sunset         --from-min -180 --to-min   60   # sunset bat emergence / bird immergence 
+--anchor sunrise        --from-min  -60 --to-min   60   # dawn
 --anchor local_midnight --from-min -360 --to-min  360   # 18:00–06:00 local
---anchor solar_noon     --from-min -120 --to-min  120   # afternoon convection
---anchor solar_midnight --from-min  -30 --to-min   30
+--anchor solar_noon     --from-min -120 --to-min  120   # afternoon insect abundance
+--anchor solar_midnight --from-min  -30 --to-min   30   # solar midnight / insect flight
 ```
 
 `utc_midnight` is the default because it needs neither a timezone nor an ephemeris: it
@@ -63,10 +61,10 @@ is the day exactly as the archive files it.
 
 Per-row overrides live in the CSV (`anchor`, `from_min`, `to_min`), and `start_utc` /
 `end_utc` columns state an absolute interval and bypass anchoring entirely. That is how
-a project keeps its own rule — a seasonal window, say — without pushing it into shared
-infrastructure. Full column list in [SCHEMAS.md](SCHEMAS.md).
+a project keeps its own rule without pushing into shared infrastructure. Full column list 
+in [SCHEMAS.md](SCHEMAS.md).
 
-## What it writes
+## What is writen
 
 ```
 <archive>/
@@ -77,21 +75,18 @@ infrastructure. Full column list in [SCHEMAS.md](SCHEMAS.md).
   logs/<run_id>.log                 free text, for debugging
 ```
 
-Three rules, because the archive is shared:
+Three rules:
 
 1. **Nothing is deleted or overwritten.** A volume already on disk is left exactly as it
-   is, whoever put it there.
+   is, regardless of who put it there.
 2. **Downloads are atomic.** Bytes land in a `.part` file and are renamed into place only
-   once the payload matches `Content-Length`. An interrupted run leaves no short file for
-   the next project to mistake for a whole volume.
+   once the payload matches `Content-Length`.
 3. **Every run identifies itself**, and the ledger records the checksum of the code that
-   ran, so a scan can be traced to the person, project and version that asked for it.
+   ran, so a scan can be traced to the person, project, and version that initiated it.
    The selection file is kept too, so the request survives even when the file that
    expressed it is later edited.
 
-A single row may not ask for more than 31 days of volumes. That is nearly always a
-mistyped offset, and the cost of one falls on the upstream bucket; express a genuinely
-long period as several rows.
+To prevent typos, a single row may not ask for more than 31 days of volumes.
 
 ## Files
 
@@ -161,13 +156,14 @@ software are inconsistent about including it. Keys are therefore resolved by lis
 station-day prefix and matching on the suffix-free stem (`scan_stem`), never by appending
 an assumed suffix, which fails silently for whole eras of the record.
 
-## Known gotchas in the data itself
+## Known issues/quirks with the data itself
 
 - **Volumes from 2006–2008 report their site position as 0, 0, 0.** Take a radar's
   latitude, longitude and altitude from `nexrad_stations.csv`, never from the file. The
   failure is silent and era-shaped, which is the worst combination.
 - **No dual-pol moments (RHOHV, ZDR) before each station's upgrade**, and the upgrade year
-  differs by station. Any processing that uses them becomes a function of year.
+  differs by station. Upgrade may not be instantaneous, either.
+  Any processing that uses them becomes a function of year.
 - **The tree is keyed by UTC day, but people think in local nights.** A Texas sunset
   window sits mostly in the *next* UTC day: local night `20200825` at KEWX is stored under
-  `2020/08/26/`. The index carries `ref_date` alongside the key for exactly this reason.
+  `2020/08/26/`. The index carries `ref_date` alongside the key for this reason.
