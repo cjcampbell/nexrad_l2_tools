@@ -161,7 +161,7 @@ def read_timezones(path: Path) -> dict[str, str]:
         return {row["station_id"]: row["tz"] for row in csv.DictReader(handle)}
 
 
-def read_selection(path: Path) -> list[dict]:
+def read_selection(path: Path, anchor_given: bool = False) -> list[dict]:
     """Rows to fetch for, with optional per-row anchor and offsets.
 
     Required: `station` and `date` (`local_date` is accepted as an alias, since existing
@@ -181,6 +181,20 @@ def read_selection(path: Path) -> list[dict]:
         raise SystemExit(f"{path} needs a `date` (or `local_date`) column")
     if "station" not in columns:
         raise SystemExit(f"{path} needs a `station` column")
+
+    # Offsets without an anchor are ambiguous, and the default is a trap. A row saying
+    # `from_min: -180` plainly means "before something meaningful"; silently measuring it
+    # from UTC midnight fetched the wrong evening for 1,920 station-nights on 2026-09-13,
+    # and the mistake was invisible until the volumes were inspected. Say so instead.
+    offsets = any(r.get("from_min") or r.get("to_min") for r in rows)
+    anchors = any(r.get("anchor") for r in rows)
+    if offsets and not anchors and not anchor_given:
+        raise SystemExit(
+            f"{path} sets from_min/to_min but names no anchor, and no --anchor was given.\n"
+            "Offsets are measured from SOMETHING, and defaulting that to utc_midnight is "
+            "how a sunset survey quietly becomes a UTC-midnight one. Add an `anchor` column, "
+            "or pass --anchor explicitly (--anchor utc_midnight if that is truly what you "
+            "want).")
 
     # argparse checks --anchor; nothing checks the column, and a typo there would
     # otherwise surface as a traceback from deep inside the anchor maths.
@@ -501,6 +515,10 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true",
                         help="resolve and report, writing nothing at all")
     args = parser.parse_args()
+    # Whether --anchor was TYPED, not merely defaulted: argparse cannot tell us, so ask
+    # the argument vector. This is what makes an explicit `--anchor utc_midnight` legal
+    # while a silent default over offset-bearing rows is not.
+    anchor_given = any(a == "--anchor" or a.startswith("--anchor=") for a in sys.argv[1:])
 
     if args.archive is None:
         from_env = os.environ.get(ENV_ARCHIVE)
@@ -533,7 +551,7 @@ def main() -> None:
     stations = read_stations(args.stations)
     timezones = read_timezones(args.timezones)
     if args.dates:
-        rows = read_selection(args.dates)
+        rows = read_selection(args.dates, anchor_given=anchor_given)
         check_intervals(rows, args.from_min, args.to_min, args.margin)
         check_rows_resolvable(rows, stations, timezones, args.anchor,
                               args.stations, args.timezones, args.skip_unknown_stations)
